@@ -85,7 +85,7 @@ def main() -> None:
              ("wrong", "Wrong", "#d9d9d9"), ("wrong_turn_cap", "Ran out of turns", "#a6a6a6"), ("no_query", "No query", "#555")]
     cats = {a: Counter(category(p[i]) for p in ps for i in q) for a, ps in P.items()}
     numbers["sample_outcomes"] = {a: dict(c) for a, c in cats.items()}
-    fig, ax = plt.subplots(figsize=(8.4, 3.6))
+    fig, ax = plt.subplots(figsize=(9.6, 3.8))
     for y, a in enumerate(reversed(list(ARMS))):
         left = 0
         for key, name, color in order:
@@ -99,7 +99,7 @@ def main() -> None:
     ax.set_yticks(range(3), [LABEL[a].replace("\n", " ") for a in reversed(list(ARMS))], fontsize=9)
     ax.set_xlabel("Samples (186 questions x 4)")
     ax.set_xlim(0, 744)
-    ax.legend(ncol=4, fontsize=8.5, loc="upper center", bbox_to_anchor=(0.5, 1.2), frameon=False)
+    ax.legend(ncol=4, fontsize=8.5, loc="upper center", bbox_to_anchor=(0.42, 1.2), frameon=False, columnspacing=1.2)
     ax.spines[["top", "right"]].set_visible(False)
     fig.tight_layout()
     fig.savefig(OUT / "fig3_outcomes.png", dpi=150)
