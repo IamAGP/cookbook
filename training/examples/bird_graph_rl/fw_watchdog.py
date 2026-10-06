@@ -83,7 +83,36 @@ def remaining_resources(lister: Callable[..., list[str]] = firectl_rows) -> dict
     return {"trainer_jobs": lister("rlor-trainer-job", "list"), "deployments": lister("deployment", "list")}
 
 
-def delete_and_verify(trainer_mgr: Any, deploy_mgr: Any, trainer_job_ids: list[str], deployment_id: str | None) -> dict[str, Any]:
+# A deleted resource can stay visible for a while in one of these states; it no longer bills.
+GONE_STATES = frozenset({"DELETED", "DELETING", "JOB_STATE_DELETED", "JOB_STATE_DELETING", "JOB_STATE_ARCHIVED"})
+
+
+def _state(resource: Any) -> str | None:
+    if resource is None:
+        return None
+    value = resource.get("state") if isinstance(resource, dict) else getattr(resource, "state", None)
+    return str(value) if value is not None else "UNKNOWN"
+
+
+def _check(entry: dict[str, Any], fetch: Callable[[], Any], settle_s: float, poll_s: float) -> None:
+    """Record whether the resource is gone, polling briefly because deletion is not instant."""
+    waited = 0.0
+    while True:
+        try:
+            state = _state(fetch())
+        except Exception as e:  # noqa: BLE001
+            entry["verify_error"] = f"{type(e).__name__}: {e}"[:200]
+            return
+        entry["state"] = state
+        entry["still_exists"] = state is not None and state not in GONE_STATES
+        if not entry["still_exists"] or waited >= settle_s:
+            return
+        time.sleep(poll_s)
+        waited += poll_s
+
+
+def delete_and_verify(trainer_mgr: Any, deploy_mgr: Any, trainer_job_ids: list[str], deployment_id: str | None,
+                      settle_s: float = 60.0, poll_s: float = 5.0) -> dict[str, Any]:
     """Delete what was created and check it is gone. Never raises: every failure is reported."""
     report: dict[str, Any] = {"trainer": {}, "deployment": {}}
     for job_id in trainer_job_ids:
@@ -93,10 +122,7 @@ def delete_and_verify(trainer_mgr: Any, deploy_mgr: Any, trainer_job_ids: list[s
             entry["deleted"] = True
         except Exception as e:  # noqa: BLE001
             entry["delete_error"] = f"{type(e).__name__}: {e}"[:200]
-        try:
-            entry["still_exists"] = trainer_mgr.try_get(job_id=job_id) is not None
-        except Exception as e:  # noqa: BLE001
-            entry["verify_error"] = f"{type(e).__name__}: {e}"[:200]
+        _check(entry, lambda job_id=job_id: trainer_mgr.try_get(job_id=job_id), settle_s, poll_s)
         report["trainer"][job_id] = entry
     if deployment_id:
         entry = {}
@@ -105,10 +131,7 @@ def delete_and_verify(trainer_mgr: Any, deploy_mgr: Any, trainer_job_ids: list[s
             entry["deleted"] = True
         except Exception as e:  # noqa: BLE001
             entry["delete_error"] = f"{type(e).__name__}: {e}"[:200]
-        try:
-            entry["still_exists"] = deploy_mgr.get(deployment_id=deployment_id) is not None
-        except Exception as e:  # noqa: BLE001
-            entry["verify_error"] = f"{type(e).__name__}: {e}"[:200]
+        _check(entry, lambda: deploy_mgr.get(deployment_id=deployment_id), settle_s, poll_s)
         report["deployment"][deployment_id] = entry
     entries = list(report["trainer"].values()) + list(report["deployment"].values())
     report["clean"] = all(e.get("still_exists") is False for e in entries)
@@ -126,6 +149,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--log-dir", required=True)
     ap.add_argument("--deployment-id", required=True)
+    ap.add_argument("--trainer-job-id", required=True)
     ap.add_argument("--deadline-epoch", type=float, required=True)
     ap.add_argument("--stall-min", type=float, required=True)
     ap.add_argument("--pid", type=int)
@@ -141,18 +165,25 @@ def main() -> None:
     log_dir = Path(args.log_dir).expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
     started = time.time()
-    write(log_dir, {"event": "watching", "deployment_id": args.deployment_id, "deadline_epoch": args.deadline_epoch,
+    write(log_dir, {"event": "watching", "deployment_id": args.deployment_id, "trainer_job_id": args.trainer_job_id,
+                    "deadline_epoch": args.deadline_epoch,
                     "stall_min": args.stall_min, "pid": args.pid})
 
     while True:
         res = read_resources(log_dir)
         finished = (log_dir / "fireworks_meta.json").exists()
+        # The ids are known from the command line, so resources may exist before the run has
+        # written anything. The stall clock only starts once provisioning has returned: waiting
+        # for GPUs writes no progress lines and is bounded by the deadline instead.
+        provisioned = bool(res.get("provisioned"))
+        marks = [t for t in (last_progress(log_dir), (log_dir / "fw_resources.json").stat().st_mtime if provisioned else None) if t]
         reason = "run_finished" if finished else decide(
-            now=time.time(), deadline_epoch=args.deadline_epoch, resources_exist=bool(res),
-            last_progress=last_progress(log_dir), stall_s=args.stall_min * 60,
+            now=time.time(), deadline_epoch=args.deadline_epoch, resources_exist=True,
+            last_progress=max(marks) if marks else None,
+            stall_s=args.stall_min * 60 if provisioned else float("inf"),
             run_alive=pid_alive(args.pid), watch_started=started)
         if reason is not None:
-            jobs = [res["trainer_job_id"]] if res.get("trainer_job_id") else []
+            jobs = sorted({args.trainer_job_id} | ({res["trainer_job_id"]} if res.get("trainer_job_id") else set()))
             report = delete_and_verify(trainer_mgr, deploy_mgr, jobs, args.deployment_id)
             write(log_dir, {"event": "teardown", "reason": reason, "report": report,
                             "remaining": remaining_resources()})

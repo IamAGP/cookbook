@@ -21,8 +21,8 @@ timestamped line per training call to ``<log_path>/fw_cost_meter.jsonl``.
 Dedicated (hourly) training is built but gated: it refuses to start unless
 ``FW_ALLOW_DEDICATED=1`` and an explicit deadline, inactivity timeout and deployment id are
 set, and it replaces the token meter with a wall-clock meter (dollars per hour since the
-resources were requested). It has never been run against real hardware. Resuming a run from a
-saved state is still refused.
+resources were requested). It has never been run against real hardware. A serverless run can be
+continued from a saved training checkpoint; a dedicated one cannot yet.
 
     FW_BUDGET_USD=3 PYTHONPATH=<tinker-cookbook> .venv/bin/python \\
         bird_graph_rl/rl_train_fireworks.py model_name=Qwen/Qwen3.8-27B \\
@@ -82,6 +82,8 @@ PRICES_PER_M: dict[str, dict[str, float]] = {
     "accounts/fireworks/models/qwen3p8-27b": {"prefill": 1.86, "sample": 5.595, "train": 4.103},
 }
 
+SAMPLE_PROGRESS_EVERY = 25  # sampling calls between progress lines in the meter file
+
 logger = logging.getLogger("bird_fireworks_rl")
 
 
@@ -119,6 +121,8 @@ class CostMeter:
         self.prompt_tokens += prompt_tokens
         self.sampled_tokens += sampled_tokens
         self.sample_calls += 1
+        if self.sample_calls % SAMPLE_PROGRESS_EVERY == 0:  # a heartbeat during long sampling phases
+            self._write({"event": "sampling"})
 
     def add_train(self, n_datums: int, tokens: int) -> None:
         self.train_tokens += tokens
@@ -189,6 +193,41 @@ class MeteredSampler:
         return response
 
 
+class RecordingFuture:
+    """A training call's future that also writes the call's own metrics to disk when resolved.
+
+    The cookbook loop logs the optimiser step's metrics but drops the forward/backward call's
+    (the loss among them, when the service returns one). This keeps them, one line per call.
+    """
+
+    def __init__(self, inner: Any, log_path: Path | None, call_index: int) -> None:
+        self._inner, self._log_path, self._call_index, self._written = inner, log_path, call_index, False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def _record(self, output: Any) -> Any:
+        if self._log_path is not None and not self._written:
+            self._written = True
+            try:
+                line = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "train_call": self._call_index,
+                        "metrics": dict(getattr(output, "metrics", None) or {})}
+                with self._log_path.open("a") as f:
+                    f.write(json.dumps(line, default=float) + "\n")
+            except Exception as e:  # noqa: BLE001 - record keeping must never break training
+                logger.warning("could not record training-call metrics: %s", e)
+        return output
+
+    async def result_async(self, *args: Any, **kwargs: Any) -> Any:
+        return self._record(await self._inner.result_async(*args, **kwargs))
+
+    def result(self, *args: Any, **kwargs: Any) -> Any:
+        return self._record(self._inner.result(*args, **kwargs))
+
+    def __await__(self) -> Any:
+        return self.result_async().__await__()
+
+
 class TrainingClientProxy:
     """A Fireworks training client that answers the two calls the cookbook loop makes which
     Fireworks does not support, shortens checkpoint names, and meters training tokens."""
@@ -240,7 +279,9 @@ class TrainingClientProxy:
     async def forward_backward_async(self, data: list[Any], *args: Any, **kwargs: Any) -> Any:
         self._meter.check()
         self._meter.add_train(len(data), sum(d.model_input.length for d in data))
-        return await self._inner.forward_backward_async(data, *args, **kwargs)
+        future = await self._inner.forward_backward_async(data, *args, **kwargs)
+        log = self._meter.log_path.with_name("fw_train_metrics.jsonl") if self._meter.log_path else None
+        return RecordingFuture(future, log, self._meter.train_calls)
 
     def close_samplers(self) -> None:
         for s in self._samplers:
@@ -260,7 +301,11 @@ def dedicated_settings(env: dict[str, str]) -> dict[str, Any]:
     missing = [k for k in ("FW_DEPLOYMENT_ID", "FW_DEADLINE_MIN", "FW_INACTIVITY_MIN") if not env.get(k)]
     if missing:
         raise SystemExit(f"dedicated run needs {', '.join(missing)}")
-    return {"deployment_id": env["FW_DEPLOYMENT_ID"], "deadline_s": float(env["FW_DEADLINE_MIN"]) * 60,
+    # Both ids are chosen here, before anything is requested, so that the watchdog and the
+    # teardown know what to delete even if provisioning fails halfway.
+    return {"deployment_id": env["FW_DEPLOYMENT_ID"],
+            "trainer_job_id": env.get("FW_TRAINER_JOB_ID") or f"{env['FW_DEPLOYMENT_ID']}-tr",
+            "deadline_s": float(env["FW_DEADLINE_MIN"]) * 60,
             "inactivity_min": float(env["FW_INACTIVITY_MIN"]),
             "pending_timeout_s": float(env.get("FW_PENDING_MIN", "20")) * 60,
             "ready_timeout_s": float(env.get("FW_READY_MIN", "30")) * 60}
@@ -278,6 +323,7 @@ def _default_service_factory(spec: dict[str, Any]) -> Any:
         lora_rank=spec["rank"], seed=spec["seed"], train_mlp=spec["train_mlp"],
         train_attn=spec["train_attn"], train_unembed=spec["train_unembed"],
         training_shape_id=shape["training_shape_id"], deployment_id=d["deployment_id"],
+        trainer_job_id=d["trainer_job_id"],
         inactivity_timeout=dt.timedelta(minutes=d["inactivity_min"]),
         trainer_pending_timeout_s=d["pending_timeout_s"], trainer_timeout_s=d["ready_timeout_s"],
         deployment_timeout_s=d["ready_timeout_s"],
@@ -304,6 +350,21 @@ def _default_deployment_hardener(deployment_id: str) -> dict[str, Any]:
     return body
 
 
+def _default_force_teardown(trainer_job_id: str, deployment_id: str) -> dict[str, Any]:
+    """Delete both hourly resources by id and report whether they are gone.
+
+    The SDK's own cleanup only knows resources whose provisioning call returned. This one works
+    from the ids alone, so it also covers a failure in the middle of provisioning.
+    """
+    from fireworks.training.sdk import DeploymentManager, TrainerJobManager
+
+    from fw_watchdog import delete_and_verify
+
+    key = os.environ["FIREWORKS_API_KEY"]
+    return delete_and_verify(TrainerJobManager(api_key=key), DeploymentManager(api_key=key),
+                             [trainer_job_id], deployment_id)
+
+
 def _default_tokenizer_loader(model_name: str) -> Any:
     from tinker_cookbook import tokenizer_utils
 
@@ -318,6 +379,9 @@ class FireworksServiceShim:
     environ: dict[str, str] = os.environ  # type: ignore[assignment]
     tokenizer_loader: Callable[[str], Any] = staticmethod(_default_tokenizer_loader)
     deployment_hardener: Callable[[str], dict[str, Any]] = staticmethod(_default_deployment_hardener)
+    force_teardown: Callable[[str, str], dict[str, Any]] = staticmethod(_default_force_teardown)
+    resume_base_model: str | None = None
+    teardown_log: Path | None = None
     budget_usd: float | None = None
     meter_log: Path | None = None
     live: list["FireworksServiceShim"] = []
@@ -331,6 +395,8 @@ class FireworksServiceShim:
         self.lora_request: dict[str, Any] = {}
         self.hardening: dict[str, Any] = {}
         self.fireworks_model = ""
+        self.dedicated: dict[str, Any] | None = None
+        self.teardown_report: dict[str, Any] | None = None
         FireworksServiceShim.live.append(self)
 
     async def create_lora_training_client_async(
@@ -351,16 +417,24 @@ class FireworksServiceShim:
             self.meter = WallClockMeter(rate, type(self).budget_usd, dedicated["deadline_s"], type(self).meter_log)
         else:
             self.meter = CostMeter(PRICES_PER_M[self.fireworks_model], type(self).budget_usd, type(self).meter_log)
-        self.service = type(self).service_factory({
-            "surface": self.surface, "fireworks_model": self.fireworks_model, "hf_model": base_model,
-            "dedicated": dedicated, "user_metadata": user_metadata, **{k: v for k, v in self.lora_request.items() if k != "base_model"}})
-        tokenizer = type(self).tokenizer_loader(base_model)
-        inner = await asyncio.to_thread(
-            self.service.create_lora_training_client, base_model=self.fireworks_model, rank=rank, seed=seed,
-            train_mlp=train_mlp, train_attn=train_attn, train_unembed=train_unembed, user_metadata=user_metadata)
-        self._record_resources(dedicated)
+        self.dedicated = dedicated
+        tokenizer = type(self).tokenizer_loader(base_model)  # local work first: nothing is billing yet
+        self._record_resources(dedicated)  # before the request, so a crash below still leaves the ids on disk
+        try:
+            self.service = type(self).service_factory({
+                "surface": self.surface, "fireworks_model": self.fireworks_model, "hf_model": base_model,
+                "dedicated": dedicated, "user_metadata": user_metadata, **{k: v for k, v in self.lora_request.items() if k != "base_model"}})
+            inner = await asyncio.to_thread(
+                self.service.create_lora_training_client, base_model=self.fireworks_model, rank=rank, seed=seed,
+                train_mlp=train_mlp, train_attn=train_attn, train_unembed=train_unembed, user_metadata=user_metadata)
+        except BaseException:
+            # Provisioning creates the trainer and the deployment before it returns. If it raises
+            # (queue timeout, readiness timeout, Ctrl-C), the SDK holds no handle to clean up.
+            self.close()
+            raise
+        self._record_resources(dedicated, provisioned=True)
         if dedicated is not None:
-            deployment_id = getattr(self.service, "deployment_id", None) or dedicated["deployment_id"]
+            deployment_id = dedicated["deployment_id"]
             try:
                 self.hardening = type(self).deployment_hardener(deployment_id)
                 logger.info("deployment %s set to scale to zero when idle: %s", deployment_id, self.hardening)
@@ -373,17 +447,18 @@ class FireworksServiceShim:
                                             keep_samplers=None if dedicated is not None else 2)
         return self.training
 
-    def _record_resources(self, dedicated: dict[str, Any] | None) -> None:
+    def _record_resources(self, dedicated: dict[str, Any] | None, provisioned: bool = False) -> None:
         """Write what is now billing, for the independent watchdog and for the post-run check."""
         path = type(self).resources_log
         if path is None:
             return
         record = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "surface": self.surface,
-                  "fireworks_model": self.fireworks_model,
+                  "fireworks_model": self.fireworks_model, "provisioned": provisioned,
                   "training_session_id": getattr(self.service, "training_session_id", None)}
         if dedicated is not None:
-            record.update({"trainer_job_id": getattr(self.service, "trainer_job_id", None),
-                           "deployment_id": getattr(self.service, "deployment_id", None) or dedicated["deployment_id"],
+            record.update({"trainer_job_id": dedicated["trainer_job_id"], "deployment_id": dedicated["deployment_id"],
+                           "sdk_trainer_job_id": getattr(self.service, "managed_trainer_job_id", None),
+                           "sdk_deployment_id": getattr(self.service, "managed_deployment_id", None),
                            "requested_epoch": self.meter.t0, "deadline_epoch": self.meter.t0 + dedicated["deadline_s"],
                            "usd_per_hour": self.meter.usd_per_hour})
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -403,18 +478,53 @@ class FireworksServiceShim:
     async def create_training_client_from_state_async(self, *_: Any, **__: Any) -> Any:
         raise NotImplementedError("starting from a saved state on Fireworks is not built or tested yet")
 
-    async def create_training_client_from_state_with_optimizer_async(self, *_: Any, **__: Any) -> Any:
-        raise NotImplementedError("resuming a run on Fireworks is not built or tested yet")
+    async def create_training_client_from_state_with_optimizer_async(
+        self, path: str, user_metadata: dict[str, str] | None = None, **_: Any,
+    ) -> TrainingClientProxy:
+        """Continue an interrupted serverless run from a saved training checkpoint.
+
+        Fireworks docs, serverless "Resume a new run from a training checkpoint": a state saved
+        by ``save_state`` can be loaded, weights and optimiser, into a fresh run in a new session.
+        The cookbook loop calls this when its log folder holds a checkpoint record, and passes
+        only the path, so the model comes from ``resume_base_model`` (set by ``main``).
+        """
+        base_model = type(self).resume_base_model
+        if base_model is None or base_model not in FIREWORKS_MODEL:
+            raise KeyError(f"resume needs a mapped model, got {base_model!r}")
+        self.fireworks_model, self.surface = FIREWORKS_MODEL[base_model]
+        if self.surface != "serverless":
+            raise NotImplementedError("resuming a dedicated run on Fireworks is not built or tested")
+        self.lora_request = {"base_model": self.fireworks_model, "resumed_from": path}
+        logger.info("fireworks resume request (serverless): %s", self.lora_request)
+        self.meter = CostMeter(PRICES_PER_M[self.fireworks_model], type(self).budget_usd, type(self).meter_log)
+        self.service = type(self).service_factory({"surface": self.surface, "fireworks_model": self.fireworks_model,
+                                                   "hf_model": base_model, "dedicated": None, "user_metadata": user_metadata})
+        tokenizer = type(self).tokenizer_loader(base_model)
+        inner = await self.service.create_training_client_from_state_with_optimizer_async(path, user_metadata=user_metadata)
+        self._record_resources(None)
+        self.training = TrainingClientProxy(inner, self.service, tokenizer, self.meter, keep_samplers=2)
+        return self.training
 
     def close(self) -> None:
         if self.training is not None:
             self.training.close_samplers()
-        if self.service is None:
-            return
-        try:
-            self.service.close()
-        except Exception as e:  # noqa: BLE001 - teardown must not mask the run's outcome
-            logger.warning("service close failed: %s", e)
+        if self.service is not None:
+            try:
+                self.service.close()
+            except Exception as e:  # noqa: BLE001 - teardown must not mask the run's outcome
+                logger.warning("service close failed: %s", e)
+        if self.dedicated is not None and self.teardown_report is None:
+            # Whatever the SDK did or did not delete, delete by id and check. Runs once.
+            try:
+                self.teardown_report = type(self).force_teardown(self.dedicated["trainer_job_id"], self.dedicated["deployment_id"])
+            except Exception as e:  # noqa: BLE001
+                self.teardown_report = {"clean": False, "error": f"{type(e).__name__}: {e}"[:300]}
+            log = logger.info if self.teardown_report.get("clean") else logger.error
+            log("dedicated teardown: %s", json.dumps(self.teardown_report, default=str))
+            path = type(self).teardown_log
+            if path is not None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({"time": time.strftime("%Y-%m-%d %H:%M:%S"), **self.teardown_report}, indent=1, default=str))
 
 
 def verify_pins() -> dict[str, str]:
@@ -479,6 +589,8 @@ def main() -> None:
     FireworksServiceShim.budget_usd = float(os.environ["FW_BUDGET_USD"])
     FireworksServiceShim.meter_log = log_dir / "fw_cost_meter.jsonl"
     FireworksServiceShim.resources_log = log_dir / "fw_resources.json"
+    FireworksServiceShim.teardown_log = log_dir / "fw_teardown.json"
+    FireworksServiceShim.resume_base_model = cfg.model_name
     problems = local_preflight(cfg, dict(dotenv_values(cfg.env_file)))
     if problems:
         raise SystemExit("local preflight failed, nothing was requested from Fireworks: " + "; ".join(problems))
@@ -498,12 +610,14 @@ def main() -> None:
         runs = []
         for shim in FireworksServiceShim.live:
             runs.append({"session": getattr(shim.service, "training_session_id", None), "surface": shim.surface,
-                         "trainer_job_id": getattr(shim.service, "trainer_job_id", None) if shim.surface == "dedicated" else None,
-                         "deployment_id": getattr(shim.service, "deployment_id", None) if shim.surface == "dedicated" else None,
+                         "trainer_job_id": shim.dedicated["trainer_job_id"] if shim.dedicated else None,
+                         "deployment_id": shim.dedicated["deployment_id"] if shim.dedicated else None,
+                         "hardening": shim.hardening,
                          "lora_request": shim.lora_request,
                          "meter": shim.meter.snapshot() if shim.meter else None,
                          "checkpoint_name_map": shim.training.name_map if shim.training else {}})
             shim.close()
+            runs[-1]["teardown"] = shim.teardown_report
         log_dir.mkdir(parents=True, exist_ok=True)
         (log_dir / "fireworks_meta.json").write_text(json.dumps({
             "framework": "fireworks-training-api", "status": status,

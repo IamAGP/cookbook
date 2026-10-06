@@ -69,6 +69,15 @@ class DecideTest(unittest.TestCase):
 
 
 class TeardownTest(unittest.TestCase):
+    def test_a_resource_still_visible_but_deleting_counts_as_gone(self) -> None:
+        class Lingering(FakeTrainerMgr):
+            def try_get(self, job_id: str) -> dict | None:
+                return {"name": job_id, "state": "JOB_STATE_DELETING" if self.deleted else "JOB_STATE_RUNNING"}
+
+        report = wd.delete_and_verify(Lingering(), FakeDeployMgr(), ["job-1"], "dep-1", settle_s=0)
+        self.assertEqual(report["trainer"]["job-1"]["state"], "JOB_STATE_DELETING")
+        self.assertTrue(report["clean"])
+
     def test_deletes_both_and_reports_clean(self) -> None:
         t, d = FakeTrainerMgr(), FakeDeployMgr()
         report = wd.delete_and_verify(t, d, ["job-1"], "dep-1")
@@ -76,13 +85,13 @@ class TeardownTest(unittest.TestCase):
         self.assertTrue(report["clean"])
 
     def test_reports_not_clean_when_a_resource_survives(self) -> None:
-        report = wd.delete_and_verify(FakeTrainerMgr(sticky=True), FakeDeployMgr(), ["job-1"], "dep-1")
+        report = wd.delete_and_verify(FakeTrainerMgr(sticky=True), FakeDeployMgr(), ["job-1"], "dep-1", settle_s=0)
         self.assertFalse(report["clean"])
         self.assertTrue(report["trainer"]["job-1"]["still_exists"])
 
     def test_a_failed_delete_does_not_stop_the_other_and_is_reported(self) -> None:
         d = FakeDeployMgr()
-        report = wd.delete_and_verify(FakeTrainerMgr(fail=True), d, ["job-1"], "dep-1")
+        report = wd.delete_and_verify(FakeTrainerMgr(fail=True), d, ["job-1"], "dep-1", settle_s=0)
         self.assertIn("503", report["trainer"]["job-1"]["delete_error"])
         self.assertEqual(d.deleted, ["dep-1"])
         self.assertFalse(report["clean"])

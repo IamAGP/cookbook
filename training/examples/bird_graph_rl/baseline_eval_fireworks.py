@@ -45,6 +45,7 @@ from _paths import fireworks_env_file, reference_uri, tinker_cookbook_dir  # noq
 HER_REPO = tinker_cookbook_dir()
 HER_FILE = "tinker_cookbook/recipes/bird_graph_rl/baseline_eval.py"
 PINNED_COMMIT = "d600861"
+EVAL_SNAPSHOT_NAME = "eval"  # sampler snapshot saved in the evaluation session; 17 characters or fewer
 MY_ENV = fireworks_env_file()
 
 SERVERLESS_URL = "https://api.fireworks.ai/training/v1/serverless"
@@ -82,24 +83,36 @@ def verify_harness_pinned() -> dict[str, str]:
 class FireworksServiceShim:
     """Stands in for ``tinker.ServiceClient`` inside her ``main()``.
 
-    Only ``create_sampling_client_async(base_model=...)`` is used by her harness.
+    Her harness calls ``create_sampling_client_async`` with either ``base_model`` (zero-shot) or
+    ``model_path`` (a trained checkpoint).
+
+    A trained checkpoint on Fireworks serverless can only be sampled inside a live training
+    session (docs, "Evaluating serverless checkpoints"); after the session that trained it has
+    closed, serving it needs a dedicated deployment. What does survive is the *training*
+    checkpoint written by ``save_state``, which a fresh session can load ("Resume a new run from a
+    training checkpoint"). So ``model_path`` here is that state path,
+    ``<account>/<run-id>/<name>``: it is loaded into a new session, a sampler snapshot is saved
+    from it without any training call, and that snapshot is sampled.
     """
 
     live: list["FireworksServiceShim"] = []
+    base_model: str | None = None  # her harness passes only model_path for a checkpoint; main() sets this
 
     def __init__(self, user_metadata: dict[str, str] | None = None, **_: Any) -> None:
         self.user_metadata = user_metadata or {}
         self.service = FiretitanServiceClient(api_key=os.environ["FIREWORKS_API_KEY"],
                                               base_url=SERVERLESS_URL)
         self.fireworks_model = ""
+        self.sampler_path: str | None = None
         FireworksServiceShim.live.append(self)
 
     async def create_sampling_client_async(self, base_model: str | None = None, model_path: str | None = None, **_: Any) -> Any:
-        if model_path is not None or base_model is None:
-            # Her harness can now sample a trained checkpoint. On Fireworks a checkpoint is bound to
-            # the session or deployment that produced it, so this needs its own path. Not built.
-            raise NotImplementedError("sampling a trained checkpoint through this wrapper is not built yet")
+        base_model = base_model or type(self).base_model
+        if base_model is None:
+            raise ValueError("base_model is unknown: set FireworksServiceShim.base_model before sampling a checkpoint")
         self.fireworks_model = FIREWORKS_MODEL[base_model]
+        if model_path is not None:
+            return await self._checkpoint_sampler(base_model, model_path)
         # The same call her main() makes for the renderer; the sampler needs it to turn the
         # renderer's integer stop token ids into the string stops the completions API accepts.
         tokenizer = tokenizer_utils.get_tokenizer(base_model)
@@ -111,6 +124,19 @@ class FireworksServiceShim:
                                           base_model=self.fireworks_model, tokenizer=tokenizer)
         logger.info("fireworks base-only sampler: model=%s session=%s",
                     getattr(sampler.deployment_sampler, "model", "?"), self.service.training_session_id)
+        return sampler
+
+    async def _checkpoint_sampler(self, base_model: str, state_path: str) -> Any:
+        if state_path.startswith("tinker://"):
+            raise SystemExit("model_path is a Tinker path; on Fireworks pass the state_path from checkpoints.jsonl")
+        tokenizer = tokenizer_utils.get_tokenizer(base_model)
+        training = await self.service.create_training_client_from_state_async(state_path)
+        future = await training.save_weights_for_sampler_async(EVAL_SNAPSHOT_NAME)
+        self.sampler_path = (await future.result_async()).path
+        sampler = await asyncio.to_thread(self.service.create_sampling_client,
+                                          model_path=self.sampler_path, tokenizer=tokenizer)
+        logger.info("fireworks checkpoint sampler: state=%s snapshot=%s session=%s",
+                    state_path, self.sampler_path, self.service.training_session_id)
         return sampler
 
     def close(self) -> None:
@@ -143,7 +169,8 @@ def main() -> None:
     cfg = chz.entrypoint(be.Config)
     if cfg.base_model not in FIREWORKS_MODEL:
         raise SystemExit(f"no Fireworks mapping for {cfg.base_model}")
-    write_fireworks_meta(cfg, provenance, {"status": "started"})
+    FireworksServiceShim.base_model = cfg.base_model
+    write_fireworks_meta(cfg, provenance, {"status": "started", "state_path": cfg.model_path})
     try:
         with mock.patch.object(be.tinker, "ServiceClient", FireworksServiceShim):
             asyncio.run(be.main(cfg))
@@ -155,7 +182,8 @@ def main() -> None:
         sessions = [s.service.training_session_id for s in FireworksServiceShim.live]
         for s in FireworksServiceShim.live:
             s.close()
-        write_fireworks_meta(cfg, provenance, {"status": status, "training_sessions": sessions})
+        write_fireworks_meta(cfg, provenance, {"status": status, "training_sessions": sessions,
+                                               "sampler_snapshots": [s.sampler_path for s in FireworksServiceShim.live]})
 
 
 if __name__ == "__main__":

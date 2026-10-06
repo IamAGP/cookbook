@@ -28,6 +28,11 @@ class FakeFuture:
         return SimpleNamespace(path=self.path)
 
 
+class FakeTrainFuture:
+    async def result_async(self) -> SimpleNamespace:
+        return SimpleNamespace(metrics={"loss:sum": 1.5}, loss_fn_outputs=["kept"])
+
+
 class FakeTraining:
     def __init__(self) -> None:
         self.saved_sampler: list[str] = []
@@ -42,9 +47,9 @@ class FakeTraining:
         self.saved_state.append(name)
         return FakeFuture(f"acct/run-1/{name}")
 
-    async def forward_backward_async(self, data: list, *a: object, **k: object) -> str:
+    async def forward_backward_async(self, data: list, *a: object, **k: object) -> FakeTrainFuture:
         self.fb_calls += 1
-        return "fb"
+        return FakeTrainFuture()
 
     async def optim_step_async(self, *a: object, **k: object) -> str:
         return "optim"  # reached through __getattr__ delegation
@@ -81,6 +86,10 @@ class FakeService:
         self.samplers.append(FakeSampler(model_path))
         return self.samplers[-1]
 
+    async def create_training_client_from_state_with_optimizer_async(self, path: str, user_metadata: object = None) -> FakeTraining:
+        self.resumed_from = path
+        return self.training
+
     def close(self) -> None:
         self.closed = True
 
@@ -95,6 +104,7 @@ class ShimTest(unittest.TestCase):
         self.specs: list[dict] = []
         self.hardened: list[str] = []
         self.harden_fails = False
+        self.torn_down: list[tuple[str, str]] = []
 
         def factory(spec: dict) -> FakeService:
             self.specs.append(spec)
@@ -106,6 +116,8 @@ class ShimTest(unittest.TestCase):
             mock.patch.object(fw.FireworksServiceShim, "environ", {}),
             mock.patch.object(fw.FireworksServiceShim, "deployment_hardener", staticmethod(self._harden)),
             mock.patch.object(fw.FireworksServiceShim, "resources_log", None),
+            mock.patch.object(fw.FireworksServiceShim, "teardown_log", None),
+            mock.patch.object(fw.FireworksServiceShim, "force_teardown", staticmethod(self._teardown)),
             mock.patch.object(fw.FireworksServiceShim, "tokenizer_loader", staticmethod(lambda name: f"tok:{name}")),
             mock.patch.object(fw.FireworksServiceShim, "budget_usd", None),
             mock.patch.object(fw.FireworksServiceShim, "meter_log", None),
@@ -118,6 +130,10 @@ class ShimTest(unittest.TestCase):
             raise RuntimeError("PATCH rejected")
         self.hardened.append(deployment_id)
         return {"minReplicaCount": 0}
+
+    def _teardown(self, trainer_job_id: str, deployment_id: str) -> dict:
+        self.torn_down.append((trainer_job_id, deployment_id))
+        return {"clean": True}
 
     def tearDown(self) -> None:
         for p in self.patches:
@@ -195,12 +211,14 @@ class ShimTest(unittest.TestCase):
                          ("dedicated", "accounts/fireworks/models/qwen3p5-9b", "Qwen/Qwen3.5-9B"))
         self.assertIs(spec["train_unembed"], False)
         self.assertEqual(spec["rank"], 32)
-        self.assertEqual(spec["dedicated"], {"deployment_id": "bird-probe", "deadline_s": 1200.0, "inactivity_min": 10.0,
+        self.assertEqual(spec["dedicated"], {"deployment_id": "bird-probe", "trainer_job_id": "bird-probe-tr",
+                                             "deadline_s": 1200.0, "inactivity_min": 10.0,
                                              "pending_timeout_s": 1200.0, "ready_timeout_s": 1800.0})
         self.assertIsInstance(shim.meter, fw.WallClockMeter)
         shape = fw.DEDICATED["accounts/fireworks/models/qwen3p5-9b"]
         self.assertEqual(shim.meter.usd_per_hour, (shape["trainer_gpus"] + shape["sampler_gpus"]) * shape["usd_per_gpu_hour"])
-        self.assertEqual((record["trainer_job_id"], record["deployment_id"], record["surface"]), ("job-fake", "dep-fake", "dedicated"))
+        self.assertEqual((record["trainer_job_id"], record["deployment_id"], record["surface"], record["provisioned"]),
+                         ("bird-probe-tr", "bird-probe", "dedicated", True))
         self.assertAlmostEqual(record["deadline_epoch"] - record["requested_epoch"], 1200.0, places=3)
         # The deployment's sampler is shared on dedicated, so the proxy must never close one.
         self.assertEqual([s.closed for s in self.service.samplers], [False, False, False])
@@ -210,7 +228,7 @@ class ShimTest(unittest.TestCase):
         with mock.patch.object(fw.FireworksServiceShim, "environ", env):
             shim = fw.FireworksServiceShim()
             self.run_async(shim.create_lora_training_client_async("Qwen/Qwen3.5-9B"))
-            self.assertEqual(self.hardened, ["dep-fake"])
+            self.assertEqual(self.hardened, ["bird-probe"])
             self.assertEqual(shim.hardening, {"minReplicaCount": 0})
             self.harden_fails = True
             self.service.closed = False
@@ -220,6 +238,73 @@ class ShimTest(unittest.TestCase):
         self.assertIn("idle billing", str(ctx.exception))
         self.assertTrue(self.service.closed)       # resources released rather than left unprotected
         self.assertIsNone(failing.training)
+        self.assertEqual(self.torn_down, [("bird-probe-tr", "bird-probe")])  # and deleted by id, checked
+
+    def test_dedicated_provisioning_failure_records_ids_first_and_tears_down_by_id(self) -> None:
+        env = {"FW_ALLOW_DEDICATED": "1", "FW_DEPLOYMENT_ID": "bird-probe", "FW_DEADLINE_MIN": "20", "FW_INACTIVITY_MIN": "10"}
+
+        def boom(**kwargs: object) -> None:
+            raise TimeoutError("trainer did not become ready")
+
+        self.service.create_lora_training_client = boom
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "fw_resources.json"
+            with mock.patch.object(fw.FireworksServiceShim, "environ", env), \
+                 mock.patch.object(fw.FireworksServiceShim, "resources_log", res):
+                shim = fw.FireworksServiceShim()
+                with self.assertRaises(TimeoutError):
+                    self.run_async(shim.create_lora_training_client_async("Qwen/Qwen3.5-9B"))
+                shim.close()  # main() closes every shim again; the teardown must not repeat
+            record = json.loads(res.read_text())
+        self.assertEqual((record["trainer_job_id"], record["deployment_id"], record["provisioned"]),
+                         ("bird-probe-tr", "bird-probe", False))
+        self.assertEqual(self.torn_down, [("bird-probe-tr", "bird-probe")])
+        self.assertEqual(shim.teardown_report, {"clean": True})
+
+    def test_dedicated_close_always_deletes_by_id_and_serverless_never_does(self) -> None:
+        env = {"FW_ALLOW_DEDICATED": "1", "FW_DEPLOYMENT_ID": "bird-probe", "FW_TRAINER_JOB_ID": "my-trainer",
+               "FW_DEADLINE_MIN": "20", "FW_INACTIVITY_MIN": "10"}
+        with mock.patch.object(fw.FireworksServiceShim, "environ", env):
+            shim = fw.FireworksServiceShim()
+            self.run_async(shim.create_lora_training_client_async("Qwen/Qwen3.5-9B"))
+            shim.close()
+        self.assertEqual(self.torn_down, [("my-trainer", "bird-probe")])
+        serverless = fw.FireworksServiceShim()
+        self.run_async(serverless.create_lora_training_client_async("Qwen/Qwen3.8-27B"))
+        serverless.close()
+        self.assertEqual(len(self.torn_down), 1)
+
+    def test_training_call_metrics_are_written_when_the_result_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            log = Path(d) / "fw_cost_meter.jsonl"
+            with mock.patch.object(fw.FireworksServiceShim, "meter_log", log):
+                shim = fw.FireworksServiceShim()
+                tc = self.run_async(shim.create_lora_training_client_async("Qwen/Qwen3.8-27B"))
+                future = self.run_async(tc.forward_backward_async([datum(10)]))
+                out = self.run_async(future.result_async())
+                self.run_async(future.result_async())  # a second read must not write a second line
+            lines = [json.loads(line) for line in (Path(d) / "fw_train_metrics.jsonl").read_text().splitlines()]
+        self.assertEqual(out.loss_fn_outputs, ["kept"])  # the loop still gets the real output
+        self.assertEqual([(line["train_call"], line["metrics"]) for line in lines], [(1, {"loss:sum": 1.5})])
+
+    def test_serverless_resume_loads_the_state_and_keeps_the_meter_and_proxy(self) -> None:
+        with mock.patch.object(fw.FireworksServiceShim, "resume_base_model", "Qwen/Qwen3.8-27B"), \
+             mock.patch.object(fw.FireworksServiceShim, "budget_usd", 3.0):
+            shim = fw.FireworksServiceShim()
+            tc = self.run_async(shim.create_training_client_from_state_with_optimizer_async("acct/run-1/000035"))
+            self.run_async(tc.save_weights_and_get_sampling_client_async())
+        self.assertEqual(self.service.resumed_from, "acct/run-1/000035")
+        self.assertEqual(self.specs[0]["surface"], "serverless")
+        self.assertIsInstance(tc, fw.TrainingClientProxy)
+        self.assertEqual(shim.meter.budget_usd, 3.0)
+        self.assertEqual(self.service.lora_kwargs, {})  # no fresh adapter was created
+
+    def test_resume_is_refused_for_a_dedicated_model(self) -> None:
+        with mock.patch.object(fw.FireworksServiceShim, "resume_base_model", "Qwen/Qwen3.5-9B"):
+            shim = fw.FireworksServiceShim()
+            with self.assertRaises(NotImplementedError):
+                self.run_async(shim.create_training_client_from_state_with_optimizer_async("acct/run-1/000035"))
+        self.assertEqual(self.specs, [])
 
     def test_serverless_run_does_not_touch_any_deployment(self) -> None:
         shim = fw.FireworksServiceShim()
@@ -317,10 +402,11 @@ class ShimTest(unittest.TestCase):
             self.assertIn("does not exist", fw.local_preflight(gone, good_env)[0])
             self.assertEqual(len(fw.local_preflight(gone, {})), 2)
 
-    def test_resume_is_refused_not_guessed(self) -> None:
+    def test_resume_without_a_known_model_is_refused_not_guessed(self) -> None:
         shim = fw.FireworksServiceShim()
-        with self.assertRaises(NotImplementedError):
+        with self.assertRaises(KeyError):
             self.run_async(shim.create_training_client_from_state_with_optimizer_async("x"))
+        self.assertEqual(self.specs, [])
 
     def test_close_closes_samplers_and_service(self) -> None:
         shim = fw.FireworksServiceShim()
