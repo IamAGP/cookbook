@@ -233,7 +233,7 @@ WHERE u.location = 'Rochester, NY'
 RETURN DISTINCT e.date AS date ORDER BY date               -- 34 rows, wrong
 ```
 
-After RL, all four samples left the rows alone:
+In the evaluation, all four samples after RL left the rows alone:
 
 ```cypher
 MATCH (u:User {location: 'Rochester, NY'})-[e:EARNED]->(b:Badge)
