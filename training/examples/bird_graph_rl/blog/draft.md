@@ -76,8 +76,8 @@ Standard policy-gradient RL, in the form the Tinker cookbook's `rl/train.py` imp
 A group where all 8 rollouts get the same reward carries no signal and is dropped. This
 matters below.
 
-We ran 37 updates. Settings were fixed in advance and are the same as a sibling experiment on
-a smaller model on another platform; this post is about the Fireworks run only.
+We ran 37 updates. Settings were fixed in advance and are the same as a
+[sibling experiment on a smaller model on another platform](../bird-graph-rl/); this post is about the Fireworks run only.
 
 ## 3. Running it on Fireworks
 
@@ -214,7 +214,9 @@ MATCH (u:User {displayName: 'csgillespie'})-[:EARNED]->(b:Badge)
 RETURN count(b) AS badgeCount                              -- 95
 ```
 
-Untrained: 4 of 8 strict, 8 of 8 lenient. Trained: 4 of 4.
+In the evaluation: untrained 4 of 8 strict, 8 of 8 lenient; trained 4 of 4. In four fresh
+attempts per model recorded for the viewer below, both got 4 of 4, so this one illustrates a
+habit the untrained model has only some of the time.
 
 **Substance: not deduplicating when nobody asked.**
 
@@ -238,15 +240,19 @@ MATCH (u:User {location: 'Rochester, NY'})-[e:EARNED]->(b:Badge)
 RETURN e.date AS date ORDER BY date                        -- 38 rows, right
 ```
 
-Untrained: 2 of 8. Trained: 4 of 4. The generated questions state explicitly when things are
-to be counted once, and a reward that demands the exact row count punishes guessing.
+In the evaluation: untrained 2 of 8, trained 4 of 4. The fresh recording was less kind: the
+trained model got 1 of 4, once adding `DISTINCT` again and twice adding a user-id column. Pooled,
+untrained 3 of 12 and trained 5 of 8. The direction holds; the "all four" does not. One
+example on four samples is an illustration, not evidence, which is why the claim rests on the
+paired test over all 186 questions.
 
 **A regression, for balance.**
 
 > *Which user has a higher reputation, Harlan or Jarrod Dixon?* (reference: `Harlan`)
 
 Untrained, 7 of 8 samples returned the name alone. After RL, 3 of 4 returned more than was
-asked (the reputation beside the name, or both users), which fails strict. Training did not uniformly teach "return
+asked (the reputation beside the name, or both users), which fails strict; in the fresh
+recording, 4 of 4 did. Pooled: untrained 10 of 12, trained 1 of 8. Training did not uniformly teach "return
 less"; on this question it pushed the other way.
 
 ## 7. Where it helped and where it did not
@@ -286,7 +292,7 @@ By BIRD's own labels, the gain is on the simple tier (0.62 to 0.70 against the c
   samples fell. It does not cover what a second training run would have produced.
 - **The control cannot prove the routes equal.** It bounds a route effect at roughly four
   points on strict.
-- **No comparison across platforms.** The sibling experiment used a 9B model. Different
+- **No comparison across platforms.** The [sibling experiment](../bird-graph-rl/) used a 9B model. Different
   student, so nothing here says one platform trains better than another.
 - **A prediction we got wrong.** Before the result, we predicted the 27B would gain *less*
   than the 9B had (4.6 points on its own platform, ledger row T8), reasoning that the 27B had less
@@ -299,16 +305,35 @@ By BIRD's own labels, the gain is on the simple tier (0.62 to 0.70 against the c
 
 ## 9. Cost
 
-| | Meter (upper bound) | |
-|---|---|---|
-| Training, 37 updates | $76.07 | 21.6M prompt tokens, 3.5M sampled, 4.0M trained |
-| Evaluation, 12 passes of 186 questions | $51.26 | about 13 minutes and $4.30 per pass |
-| Trial, tests, two abandoned starts | about $9 | |
+Two kinds of number, kept apart. Fireworks bills per day, not per job, so the bill cannot be
+split by component. Our own meter can, but it prices every prompt token at the uncached rate,
+so it overstates.
 
-**Billed in total: $118.96** ($3.12 in September, $115.84 in October), against $150 of
-credit. No hourly resource was ever running, so nothing could be left on by mistake. The one
-time we did request dedicated hardware, the request was refused and an independent watchdog
-deleted the queued trainer job within a minute.
+**What was billed:**
+
+| Period | Billed |
+|---|---|
+| September (first baseline pass and setup) | $3.12 |
+| 3 October (trial, training run, eight evaluation passes, tests) | $99.52 |
+| 6 October (four control passes) | $16.32 |
+| **Total** | **$118.96** |
+
+**Where it went, by our meter (upper bound):**
+
+| Component | Meter |
+|---|---|
+| Training, 37 updates (21.6M prompt tokens, 3.5M sampled, 4.0M trained) | $76.07 |
+| Evaluation, 12 passes of 186 questions ($4.27 a pass, about 13 minutes each) | $51.26 |
+| Trial, tests, two abandoned starts | $8.56 |
+| **Total** | **$135.89** |
+
+The bill is 87.5% of the meter's total. The difference is prompt caching: an agent re-sends
+its growing conversation every turn, and about half of those prompt tokens were billed at the
+cached rate.
+
+The $118.96 came out of $150 of credit. No hourly resource was ever running, so nothing could
+be left on by mistake. The one time we did request dedicated hardware, the request was refused
+and an independent watchdog deleted the queued trainer job within a minute.
 
 ## 10. What we would do next
 

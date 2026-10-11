@@ -3,7 +3,7 @@
 RL post-training of an open model to answer questions by writing Cypher against a Neo4j graph
 (BIRD-SQL `codebase_community`), run on Fireworks' serverless Training API.
 
-**Start with the write-up: [`blog/draft.md`](blog/draft.md).** Result in one line: Qwen 3.8 27B,
+**Start with the write-up:** [published post](https://adithyag73.github.io/first_principles/bird-graph-rl-fireworks/), source in [`blog/draft.md`](blog/draft.md). Result in one line: Qwen 3.8 27B,
 trained for 37 updates on generated questions, gains 6.2 points of strict accuracy on 186
 held-out human questions (95% interval 3.1 to 9.4) against an untrained adapter served the same
 way.
@@ -35,6 +35,7 @@ does not, plus the checks and analyses done on this side.
 | `make_untrained_state.py` | Saves a never-trained adapter's state for the serving-route control. |
 | `fw_r1_check.py`, `fw_e3_check.py` | The pre-registered tests: trained against base, and the three-arm test with the control. |
 | `run2_check.py`, `hint_overlap.py`, `cypher_shapes.py` | Reproductions and checks done for the sibling experiment. |
+| `record_transcripts.py` | Verbatim agent transcripts for the post's trajectory viewer (runs the peer's recorder with Fireworks sessions). |
 | `blog/` | The write-up, its figures, the script that draws them, and the numbers behind each figure. |
 | `*_test.py` | Offline tests (no network, no spend). |
 | `JOURNAL.md` | Dated lab notebook: observed, interpretation, decision. |
@@ -48,6 +49,7 @@ and every billed action are in `JOURNAL.md`, entries FW-T1 to FW-E3.
 - One training run: 37 updates of 8 questions x 8 rollouts on Qwen 3.8 27B.
 - Twelve evaluation passes on the 186 benchmark questions: four of the base model, four of a
   never-trained adapter (serving-route control), four of the trained adapter.
+- 24 verbatim transcripts of the post's three worked examples, for its trajectory viewer.
 - A request for dedicated GPUs for a smaller model, which the account could not make without a
   payment method; nothing ran.
 

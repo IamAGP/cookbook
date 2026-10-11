@@ -1578,3 +1578,64 @@ extra output added after training).
 
 Project cost on Fireworks: billed $3.12 in September and $115.84 in October for this work
 ($126.77 less the owner's $10.93), $118.96 in total.
+
+## 2026-10-06 — Draft corrected after the peer's read; pushed to the owner's public fork
+
+The peer's factual read gave four corrections (hint-rate exception, "last query that ran
+successfully", post-revision nodes and 14 relationship types, reward as F1 capped at 0.99); all
+applied. Her fact that the 9B solved 10 of the 27B's 36 never-solved questions at least once,
+7 of them untrained, was checked from her twelve folders before it went into the post.
+
+The owner said "Okay, you can do it" to pushing. Copied the folder into the fork's clone,
+replaced local paths, the Fireworks account id, session ids, the owner's email and one private
+individual's name in the public copy, scanned for eleven patterns (0 files match apart from
+file names beginning `fw_` and a dummy `bolt://x` in a test), rewrote the README, and pushed
+branch `bird-graph-rl` to IamAGP/cookbook (`ab24d9b`, then `a785cf6` for a clipped legend).
+Opened the rendered post in Chrome: 12 headings, 6 figures loaded, 3 tables, 4 code blocks.
+`main` on the fork is untouched.
+
+## 2026-10-11 — FW-X1 preflight: verbatim transcripts for the post's trajectory viewer
+
+**Approval.** The owner, in this session: "i approve ur run.. record the starting balance and
+also end". Requested by the peer for a side-by-side trajectory viewer like the one in her post.
+
+**What will run.** `record_transcripts.py`: the peer's `eval_transcripts.py` (commit 79c3cd7)
+unchanged, with each model served as in FW-E2 and FW-E3 (saved state loaded into a fresh
+serverless session, snapshot sampled). Questions 551, 613 and 531 of the 186 (the post's worked
+examples); arms: the untrained state (FW-E3) and the trained `final` state (FW-R1); four
+attempts each, temperature 1.0, same prompt, tool, renderer and limits. 24 attempts.
+Output `~/bird_rl_runs/blog_transcripts_fireworks.json`. These are fresh attempts, not the
+evaluation's, and will be labelled so.
+
+**Cost.** Evaluation passes cost $4.27 a pass on the meter, about $0.023 per attempt, so about
+$0.55 plus two state loads. No cost stop in this script; it is 24 attempts with a hard cap of
+8 turns and 16,384 sampled tokens each. **Opening balance:** billed in October $126.77, on
+2026-10-11 $0.00 (`firectl billing get-usage`, 11:14). No trainer jobs or deployments.
+
+**The four questions.** Progress: one line per finished attempt. Incremental: no, the file is
+written once at the end; acceptable for a ten-minute, sub-dollar run, and a failure costs only a
+rerun. Memory: 24 conversations at most. Killed at 80%: nothing is kept; rerun.
+
+## 2026-10-11 — FW-X1 result: 24 transcripts recorded; two of the three examples look weaker in fresh samples
+
+Ran 11:15:17 to 11:20:09, exit 0, 24 attempts written to
+`~/bird_rl_runs/blog_transcripts_fireworks.json` (fields as the peer specified; messages from the
+user turn onward, thinking parts included). Two fresh sessions, both closed. **Closing balance:**
+October $127.21, 2026-10-11 $0.44 (`firectl billing get-usage`, 11:20; may still rise as billing
+posts).
+
+Strict correct, fresh recording against the evaluation (FW-E2/E3):
+
+| question | untrained, recorded | untrained, evaluation | trained, recorded | trained, evaluation |
+|---|---|---|---|---|
+| 551 badges | 4 of 4 | 4 of 8 | 4 of 4 | 4 of 4 |
+| 613 Rochester dates | 1 of 4 | 2 of 8 | 1 of 4 | 4 of 4 |
+| 531 Harlan or Dixon | 3 of 4 | 7 of 8 | 0 of 4 | 1 of 4 |
+
+Pooled over both, 613 is untrained 3 of 12 and trained 5 of 8; 551 untrained 8 of 12, trained
+8 of 8; 531 untrained 10 of 12, trained 1 of 8. In the recording the trained model on 613 used
+`DISTINCT` once and added a user-id column twice (lenient right, strict wrong). So the post's
+"after RL, all four samples left the rows alone" was true of the evaluation and is not a stable
+property: per-question rates from four samples are noisy, which is the reason the post's claim
+rests on the paired test over 186 questions and not on examples. The post's example text must
+give pooled counts and say this.
