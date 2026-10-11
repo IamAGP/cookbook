@@ -1,0 +1,155 @@
+{
+ "n_questions": 186,
+ "samples_per_question": 4,
+ "accuracy": {
+  "correct/base": {
+   "mean": 0.586,
+   "ci95": [
+    0.5296,
+    0.6411
+   ]
+  },
+  "correct/control": {
+   "mean": 0.5981,
+   "ci95": [
+    0.5444,
+    0.6532
+   ]
+  },
+  "correct/trained": {
+   "mean": 0.6599,
+   "ci95": [
+    0.5995,
+    0.7191
+   ]
+  },
+  "lenient/base": {
+   "mean": 0.6586,
+   "ci95": [
+    0.5995,
+    0.7151
+   ]
+  },
+  "lenient/control": {
+   "mean": 0.6559,
+   "ci95": [
+    0.5981,
+    0.7137
+   ]
+  },
+  "lenient/trained": {
+   "mean": 0.6868,
+   "ci95": [
+    0.6277,
+    0.746
+   ]
+  }
+ },
+ "strict_per_pass": {
+  "base": [
+   0.6075,
+   0.5806,
+   0.586,
+   0.5699
+  ],
+  "control": [
+   0.5753,
+   0.629,
+   0.5699,
+   0.6183
+  ],
+  "trained": [
+   0.6505,
+   0.6828,
+   0.6559,
+   0.6505
+  ]
+ },
+ "sample_outcomes": {
+  "base": {
+   "strict": 436,
+   "wrong": 211,
+   "wrong_turn_cap": 43,
+   "lenient_only": 54
+  },
+  "control": {
+   "wrong": 206,
+   "strict": 445,
+   "lenient_only": 43,
+   "wrong_turn_cap": 50
+  },
+  "trained": {
+   "strict": 491,
+   "wrong_turn_cap": 51,
+   "wrong": 182,
+   "lenient_only": 20
+  }
+ },
+ "by_untrained_group": {
+  "Never solved untrained (0 of 8)": {
+   "n": 36,
+   "untrained": 0.0,
+   "trained": 0.0,
+   "questions_trained_above_zero": 0
+  },
+  "Sometimes solved (1 to 7 of 8)": {
+   "n": 112,
+   "untrained": 0.644,
+   "trained": 0.7723,
+   "questions_trained_above_zero": 105
+  },
+  "Always solved untrained (8 of 8)": {
+   "n": 38,
+   "untrained": 1.0,
+   "trained": 0.9539,
+   "questions_trained_above_zero": 38
+  }
+ },
+ "per_question_change_histogram": {
+  "-0.625": 1,
+  "-0.5": 2,
+  "-0.375": 3,
+  "-0.25": 9,
+  "-0.125": 15,
+  "0.0": 76,
+  "0.125": 41,
+  "0.25": 15,
+  "0.375": 16,
+  "0.5": 4,
+  "0.625": 3,
+  "0.75": 1
+ },
+ "training": {
+  "updates": 37,
+  "rollouts": 2368,
+  "groups": 296,
+  "groups_kept": 155,
+  "groups_all_correct": 134,
+  "groups_all_wrong": 7,
+  "trained_tokens": 3953747,
+  "seconds": 13943,
+  "meter_usd_upper": 76.0708,
+  "reward_first9": 0.8214,
+  "reward_last9": 0.8958
+ },
+ "by_tier": {
+  "simple": {
+   "n": 151,
+   "base": 0.6126,
+   "control": 0.6175,
+   "trained": 0.702
+  },
+  "moderate": {
+   "n": 30,
+   "base": 0.4667,
+   "control": 0.5,
+   "trained": 0.45
+  },
+  "challenging": {
+   "n": 5,
+   "base": 0.5,
+   "control": 0.6,
+   "trained": 0.65
+  }
+ }
+}
